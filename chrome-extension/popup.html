@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <title>Page Monitor</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="container">
+
+    <header>
+      <span class="logo">🔔</span>
+      <h1>Leboncoin Monitor</h1>
+    </header>
+
+    <!-- Add form -->
+    <section class="card">
+      <h2>Ajouter une surveillance</h2>
+      <form id="addForm">
+        <div class="form-row">
+          <label for="name">Nom</label>
+          <input id="name" type="text" placeholder="Ex : Hellfest billets" required />
+        </div>
+        <div class="form-row">
+          <label for="url">URL de recherche leboncoin</label>
+          <div class="url-row">
+            <input id="url" type="url" placeholder="https://www.leboncoin.fr/recherche?…" required />
+            <button type="button" id="useCurrentUrl" title="Utiliser l'onglet actif">📋</button>
+          </div>
+        </div>
+        <div class="form-row">
+          <label for="frequency">Fréquence de vérification</label>
+          <select id="frequency">
+            <option value="1">Toutes les minutes</option>
+            <option value="5" selected>Toutes les 5 minutes</option>
+            <option value="10">Toutes les 10 minutes</option>
+            <option value="15">Toutes les 15 minutes</option>
+            <option value="30">Toutes les 30 minutes</option>
+            <option value="60">Toutes les heures</option>
+          </select>
+        </div>
+        <div id="formError" class="form-error hidden"></div>
+        <button type="submit" id="submitBtn">Ajouter</button>
+      </form>
+    </section>
+
+    <!-- Monitors list -->
+    <section class="card" id="listSection">
+      <h2>Surveillances <span id="monitorCount" class="badge">0</span></h2>
+      <div id="monitorsList"></div>
+    </section>
+
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
