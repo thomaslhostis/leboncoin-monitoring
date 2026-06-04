@@ -28,7 +28,13 @@ chrome.notifications.onClicked.addListener(async (notifId) => {
   const { [KEY_NOTIF]: notifUrls = {} } = await chrome.storage.local.get(KEY_NOTIF);
   const url = notifUrls[notifId];
   if (url) {
-    chrome.tabs.create({ url });
+    try {
+      await chrome.tabs.create({ url });
+    } catch (e) {
+      if (e.message && e.message.toLowerCase().includes('no current window')) {
+        await chrome.windows.create({ url, focused: true });
+      }
+    }
     delete notifUrls[notifId];
     await chrome.storage.local.set({ [KEY_NOTIF]: notifUrls });
   }
@@ -38,10 +44,11 @@ chrome.notifications.onClicked.addListener(async (notifId) => {
 
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   const handlers = {
-    ADD_MONITOR: () => addMonitor(msg.monitor),
-    REMOVE_MONITOR: () => removeMonitor(msg.monitorId),
-    TOGGLE_MONITOR: () => toggleMonitor(msg.monitorId, msg.enabled),
-    CHECK_NOW: () => checkPage(msg.monitorId),
+    ADD_MONITOR:      () => addMonitor(msg.monitor),
+    REMOVE_MONITOR:   () => removeMonitor(msg.monitorId),
+    TOGGLE_MONITOR:   () => toggleMonitor(msg.monitorId, msg.enabled),
+    UPDATE_FREQUENCY: () => updateFrequency(msg.monitorId, msg.frequency),
+    CHECK_NOW:        () => checkPage(msg.monitorId),
   };
   const fn = handlers[msg.type];
   if (!fn) return;
@@ -83,6 +90,18 @@ async function toggleMonitor(monitorId, enabled) {
     chrome.alarms.create(monitorId, { periodInMinutes: monitor.frequency, delayInMinutes: 0.1 });
   } else {
     chrome.alarms.clear(monitorId);
+  }
+}
+
+async function updateFrequency(monitorId, frequency) {
+  const { monitors = [] } = await chrome.storage.local.get(KEY_MONITORS);
+  const updated = monitors.map((m) => (m.id === monitorId ? { ...m, frequency } : m));
+  await chrome.storage.local.set({ [KEY_MONITORS]: updated });
+  // Recrée l'alarme avec la nouvelle fréquence si le monitor est actif
+  const monitor = updated.find((m) => m.id === monitorId);
+  if (monitor && monitor.enabled !== false) {
+    await chrome.alarms.clear(monitorId);
+    chrome.alarms.create(monitorId, { periodInMinutes: frequency, delayInMinutes: 0.1 });
   }
 }
 
@@ -154,15 +173,127 @@ async function sendNotification(monitorId, title, message, targetUrl) {
   });
 }
 
-// ── Leboncoin tab-based fetching ──────────────────────────────────────────────
-// fetch() depuis un service worker est bloqué par Cloudflare (HTTP 403).
-// On ouvre un vrai onglet en arrière-plan pour que la requête parte avec le
-// vrai contexte navigateur (cookies, TLS fingerprint, etc.).
+// ── Leboncoin fetching ────────────────────────────────────────────────────────
+// Stratégie en cascade :
+//  1. Injection dans un onglet leboncoin.fr déjà ouvert (world:MAIN → same-origin,
+//     Sec-Fetch-Site:same-origin → passe Cloudflare sans ouvrir de nouvel onglet).
+//  2. Offscreen document (peut fonctionner si __cf_clearance encore valide).
+//  3. Onglet en arrière-plan (filet de sécurité, toujours fonctionnel).
+
+const OFFSCREEN_URL = chrome.runtime.getURL('offscreen.html');
+
+async function ensureOffscreenDocument() {
+  const contexts = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT'],
+    documentUrls: [OFFSCREEN_URL],
+  });
+  if (contexts.length > 0) return;
+  await chrome.offscreen.createDocument({
+    url: OFFSCREEN_URL,
+    reasons: ['DOM_SCRAPING'],
+    justification: 'Parsing leboncoin search results HTML without a visible tab',
+  });
+}
 
 async function fetchLeboncoinAds(url) {
-  let tabId = null;
+  // ── Tentative 1 : onglet leboncoin existant (aucun nouvel onglet) ─────────
   try {
-    const tab = await chrome.tabs.create({ url, active: false });
+    const data = await fetchViaSameOriginTab(url);
+    if (data) return data;
+  } catch (e) {
+    console.warn('[LBC] same-origin tab échoué :', e.message);
+  }
+
+  // ── Tentative 2 : offscreen document ─────────────────────────────────────
+  try {
+    await ensureOffscreenDocument();
+    const result = await chrome.runtime.sendMessage({ type: 'FETCH_LBC', url });
+    if (result?.ok && result.data) return result.data;
+    throw new Error(result?.error ?? 'Réponse invalide du document offscreen');
+  } catch (e) {
+    console.warn('[LBC] offscreen échoué :', e.message);
+    try { await chrome.offscreen.closeDocument(); } catch (_) {}
+  }
+
+  // ── Tentative 3 : onglet en arrière-plan (fallback garanti) ───────────────
+  return fetchLeboncoinAdsViaTab(url);
+}
+
+/**
+ * Injecte une iframe invisible dans un onglet leboncoin.fr déjà ouvert.
+ * La navigation iframe est same-origin (leboncoin → leboncoin) :
+ *   - Sec-Fetch-Mode: navigate / Sec-Fetch-Site: same-origin → passe Cloudflare
+ *   - Les deux documents étant same-origin, on peut lire iframe.contentDocument
+ * Aucun nouvel onglet n'est créé.
+ */
+async function fetchViaSameOriginTab(url) {
+  const tabs = await chrome.tabs.query({ url: 'https://www.leboncoin.fr/*' });
+  if (tabs.length === 0) return null;
+
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId: tabs[0].id },
+    world: 'MAIN',
+    func: (targetUrl) => {
+      return new Promise((resolve) => {
+        const iframe = document.createElement('iframe');
+        iframe.style.cssText = 'position:fixed;width:0;height:0;border:none;visibility:hidden;pointer-events:none;';
+
+        const cleanup = () => { try { document.body.removeChild(iframe); } catch (_) {} };
+        const timer = setTimeout(() => { cleanup(); resolve(null); }, 25_000);
+
+        iframe.onload = () => {
+          clearTimeout(timer);
+          try {
+            const el = iframe.contentDocument && iframe.contentDocument.getElementById('__NEXT_DATA__');
+            if (!el) { cleanup(); resolve(null); return; }
+            const data = JSON.parse(el.textContent);
+            const ads = data && data.props && data.props.pageProps && data.props.pageProps.searchData && data.props.pageProps.searchData.ads;
+            if (!Array.isArray(ads)) { cleanup(); resolve(null); return; }
+            const parsed = ads.map(function(ad) {
+              return {
+                id: String(ad.list_id),
+                url: 'https://www.leboncoin.fr' + ad.url,
+                title: ad.subject || 'Sans titre',
+                price: (ad.price && ad.price[0]) != null ? ad.price[0] : null,
+              };
+            });
+            cleanup();
+            resolve(parsed);
+          } catch (_) {
+            cleanup();
+            resolve(null);
+          }
+        };
+
+        iframe.onerror = function() { clearTimeout(timer); cleanup(); resolve(null); };
+        iframe.src = targetUrl;
+        document.body.appendChild(iframe);
+      });
+    },
+    args: [url],
+  });
+
+  return result?.result ?? null;
+}
+
+async function fetchLeboncoinAdsViaTab(url) {
+  let tabId = null;
+  let windowId = null;
+  try {
+    // Si aucune fenêtre n'est ouverte, chrome.tabs.create lève "No current window".
+    // On utilise alors chrome.windows.create pour créer une fenêtre minimisée.
+    let tab;
+    try {
+      tab = await chrome.tabs.create({ url, active: false });
+    } catch (e) {
+      if (e.message && e.message.toLowerCase().includes('no current window')) {
+        const win = await chrome.windows.create({ url, state: 'minimized', focused: false });
+        tab = win.tabs[0];
+        windowId = win.id;
+      } else {
+        throw e;
+      }
+    }
     tabId = tab.id;
 
     await waitForTabComplete(tabId, 30_000);
@@ -177,7 +308,12 @@ async function fetchLeboncoinAds(url) {
 
     return data;
   } finally {
-    if (tabId !== null) chrome.tabs.remove(tabId).catch(() => {});
+    // Fermer la fenêtre entière si on en a créé une, sinon juste l'onglet
+    if (windowId !== null) {
+      chrome.windows.remove(windowId).catch(() => {});
+    } else if (tabId !== null) {
+      chrome.tabs.remove(tabId).catch(() => {});
+    }
   }
 }
 
@@ -194,7 +330,7 @@ async function waitForTabComplete(tabId, timeoutMs) {
 }
 
 /**
- * Fonction injectée dans l'onglet leboncoin.
+ * Fonction injectée dans l'onglet leboncoin (fallback uniquement).
  * Lit __NEXT_DATA__ et retourne le tableau des annonces normalisées.
  * IMPORTANT : cette fonction s'exécute dans le contexte de la page,
  * pas dans celui de l'extension — pas d'accès aux API chrome ici.

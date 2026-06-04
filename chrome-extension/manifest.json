@@ -9,7 +9,8 @@
     "storage",
     "activeTab",
     "tabs",
-    "scripting"
+    "scripting",
+    "offscreen"
   ],
   "host_permissions": ["https://www.leboncoin.fr/*"],
   "background": {

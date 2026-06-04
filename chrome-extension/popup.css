@@ -184,6 +184,27 @@ input:focus, select:focus {
 
 .item-actions { display: flex; gap: 6px; align-items: center; }
 
+/* ── Inline frequency select ─────────────────────────────────────────────── */
+.freq-row { display: flex; align-items: center; gap: 4px; }
+.freq-select {
+  width: auto !important; /* override the global select { width:100% } */
+  padding: 1px 4px !important;
+  height: auto;
+  font-size: 11px !important;
+  border: 1px solid #dadce0;
+  border-radius: 4px;
+  background: #f8f9fa;
+  color: #5f6368;
+  cursor: pointer;
+  line-height: 1.4;
+  box-shadow: none;
+}
+.freq-select:focus {
+  border-color: #1a73e8;
+  box-shadow: 0 0 0 2px rgba(26,115,232,.15);
+  outline: none;
+}
+
 .btn-sm {
   padding: 5px 10px;
   border: none;

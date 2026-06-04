@@ -8,6 +8,22 @@ function esc(str) {
     .replace(/"/g, '&quot;');
 }
 
+const FREQ_OPTIONS = [
+  { value: 1,  label: '1 min' },
+  { value: 5,  label: '5 min' },
+  { value: 10, label: '10 min' },
+  { value: 15, label: '15 min' },
+  { value: 30, label: '30 min' },
+  { value: 60, label: '1 h' },
+];
+
+function freqOptions(current) {
+  return FREQ_OPTIONS.map(
+    ({ value, label }) =>
+      `<option value="${value}" ${current === value ? 'selected' : ''}>${label}</option>`
+  ).join('');
+}
+
 function relTime(ts) {
   if (!ts) return 'jamais';
   const diff = Date.now() - ts;
@@ -37,8 +53,6 @@ function renderMonitor(m) {
     .filter(Boolean)
     .join(' ');
 
-  const freqLabel = m.frequency === 1 ? '1 min' : `${m.frequency} min`;
-
   return `
     <div class="${itemClass}" data-id="${esc(m.id)}" data-url="${esc(m.url)}">
       <div class="item-header">
@@ -53,7 +67,7 @@ function renderMonitor(m) {
       <div class="item-url js-open-url" title="Ouvrir la recherche">${esc(m.url)}</div>
 
       <div class="item-meta">
-        <span>⏱ ${freqLabel}</span>
+        <span class="freq-row">⏱ <select class="freq-select js-freq" title="Modifier la fréquence">${freqOptions(m.frequency)}</select></span>
         <span>🕒 ${relTime(m.lastCheck)}</span>
       </div>
 
@@ -99,6 +113,12 @@ async function loadMonitors() {
       btn.textContent = '…';
       await chrome.runtime.sendMessage({ type: 'CHECK_NOW', monitorId: id });
       setTimeout(loadMonitors, 1500);
+    });
+
+    el.querySelector('.js-freq').addEventListener('change', async (e) => {
+      const frequency = parseInt(e.target.value, 10);
+      await chrome.runtime.sendMessage({ type: 'UPDATE_FREQUENCY', monitorId: id, frequency });
+      // Pas de reload : le select est déjà à jour visuellement
     });
 
     el.querySelector('.js-delete').addEventListener('click', async () => {
