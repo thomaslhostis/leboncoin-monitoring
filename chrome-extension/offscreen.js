@@ -17,16 +17,33 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
 
 async function fetchAndParse(url) {
   const res = await fetch(url, {
-    credentials: 'include', // envoie automatiquement les cookies leboncoin/Cloudflare
+    credentials: 'include',
     headers: {
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'fr-FR,fr;q=0.9',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+      // Simule une navigation directe plutôt qu'un fetch programmatique
+      'Cache-Control': 'max-age=0',
+      'Upgrade-Insecure-Requests': '1',
     },
   });
 
-  if (!res.ok) throw new Error(`HTTP ${res.status} — Cloudflare ou site indisponible`);
+  if (!res.ok) {
+    const hint = (res.status === 403 || res.status === 503)
+      ? ' — cookie Cloudflare expiré, visitez leboncoin.fr pour le renouveler'
+      : '';
+    throw new Error(`HTTP ${res.status}${hint}`);
+  }
 
   const html = await res.text();
+
+  // Cloudflare renvoie parfois un 200 avec une page de challenge
+  if (
+    html.includes('cf-browser-verification') ||
+    html.includes('challenge-form') ||
+    (html.includes('__cf_chl') && !html.includes('__NEXT_DATA__'))
+  ) {
+    throw new Error('Page de challenge Cloudflare reçue — cookie expiré');
+  }
 
   const match = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
   if (!match) throw new Error('__NEXT_DATA__ introuvable dans la réponse HTML');
@@ -48,4 +65,3 @@ async function fetchAndParse(url) {
     price: ad.price?.[0] ?? null,
   }));
 }
-

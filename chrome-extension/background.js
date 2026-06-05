@@ -1,6 +1,7 @@
 const KEY_MONITORS = 'monitors';
 const KEY_SNAPSHOTS = 'snapshots';
 const KEY_NOTIF = 'notif_urls'; // maps notifId → URL to open on click
+const KEY_CHECKER_WIN = 'checker_window_id';
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
@@ -194,46 +195,75 @@ async function ensureOffscreenDocument() {
 }
 
 async function fetchLeboncoinAds(url) {
-  // ── Tentative 1 : offscreen document (aucun onglet visible) ──────────────
-  try {
-    await ensureOffscreenDocument();
-    const result = await chrome.runtime.sendMessage({ type: 'FETCH_LBC', url });
-    if (result?.ok && result.data) return result.data;
-    throw new Error(result?.error ?? 'Réponse invalide du document offscreen');
-  } catch (e) {
-    console.warn('[LBC] offscreen échoué, fallback onglet :', e.message);
-    try { await chrome.offscreen.closeDocument(); } catch (_) {}
+  // ── Tentatives via offscreen document (aucun onglet visible) ─────────────
+  const DELAYS = [0, 800, 2000]; // 3 essais : immédiat, 800 ms, 2 s
+  let lastError;
+  for (const delay of DELAYS) {
+    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+    try {
+      await ensureOffscreenDocument();
+      const result = await chrome.runtime.sendMessage({ type: 'FETCH_LBC', url });
+      if (result?.ok && result.data) return result.data;
+      throw new Error(result?.error ?? 'Réponse invalide du document offscreen');
+    } catch (e) {
+      lastError = e;
+      console.warn(`[LBC] offscreen tentative échouée (${e.message}), réinitialisation…`);
+      // Recrée le document pour repartir d'un état propre
+      try { await chrome.offscreen.closeDocument(); } catch (_) {}
+    }
   }
 
-  // ── Tentative 2 : onglet en arrière-plan (fallback garanti) ───────────────
+  console.warn('[LBC] offscreen définitivement échoué, fallback onglet :', lastError?.message);
+
+  // ── Fallback : onglet en arrière-plan (fenêtre minimisée) ─────────────────
   return fetchLeboncoinAdsViaTab(url);
 }
 
 
+// File d'attente : les vérifications utilisent toutes la même fenêtre dédiée,
+// elles doivent donc s'exécuter l'une après l'autre.
+let checkerQueue = Promise.resolve();
+
 async function fetchLeboncoinAdsViaTab(url) {
-  let windowId = null;
-  let tabId = null;
-  try {
-    // Toujours ouvrir dans une nouvelle fenêtre minimisée plutôt que dans
-    // la fenêtre active de l'utilisateur, pour ne pas perturber sa navigation.
-    const win = await chrome.windows.create({ url, state: 'minimized', focused: false });
-    windowId = win.id;
-    tabId = win.tabs[0].id;
+  const result = await (checkerQueue = checkerQueue.then(() => runInCheckerWindow(url)));
+  return result;
+}
 
-    await waitForTabComplete(tabId, 30_000);
-
-    const [result] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: extractLeboncoinDataFromPage,
-    });
-
-    const data = result?.result;
-    if (!data) throw new Error('Impossible de lire les données leboncoin (page inattendue ?)');
-
-    return data;
-  } finally {
-    if (windowId !== null) chrome.windows.remove(windowId).catch(() => {});
+async function ensureCheckerWindow() {
+  const { [KEY_CHECKER_WIN]: storedId } = await chrome.storage.local.get(KEY_CHECKER_WIN);
+  if (storedId != null) {
+    try {
+      await chrome.windows.get(storedId);
+      return storedId; // fenêtre toujours vivante
+    } catch (_) { /* fermée par l'utilisateur, on en recrée une */ }
   }
+  // Créer la fenêtre dédiée une seule fois ; elle reste minimisée en permanence.
+  // Naviguer dans son onglet ne déclenche pas de changement d'espace macOS,
+  // contrairement à chrome.windows.create() qui en crée toujours un nouveau.
+  const win = await chrome.windows.create({ url: 'about:blank', state: 'minimized', focused: false });
+  await chrome.storage.local.set({ [KEY_CHECKER_WIN]: win.id });
+  return win.id;
+}
+
+async function runInCheckerWindow(url) {
+  const windowId = await ensureCheckerWindow();
+  const win = await chrome.windows.get(windowId, { populate: true });
+  const tabId = win.tabs[0].id;
+
+  await chrome.tabs.update(tabId, { url });
+  await waitForTabComplete(tabId, 30_000);
+
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: extractLeboncoinDataFromPage,
+  });
+
+  // Remettre à blanc pour libérer la mémoire jusqu'à la prochaine vérification
+  chrome.tabs.update(tabId, { url: 'about:blank' }).catch(() => {});
+
+  const data = result?.result;
+  if (!data) throw new Error('Impossible de lire les données leboncoin (page inattendue ?)');
+  return data;
 }
 
 /** Attend que l'onglet atteigne le statut "complete" ou lève une erreur en cas de timeout. */
