@@ -11,26 +11,44 @@ import zlib
 
 
 def make_png(size: int) -> bytes:
-    """Génère un PNG RGBA de taille `size`x`size` avec une cloche stylisée."""
+    """Génère un PNG RGBA de taille `size`x`size` avec un canard stylisé."""
     cx, cy = size / 2.0, size / 2.0
 
     def pixel(px: int, py: int) -> tuple[int, int, int, int]:
-        # Normalisation en coordonnées [-1, 1]
+        # Normalisation en coordonnées : nx/ny ∈ [-1, 1], ny positif vers le bas
         nx = (px - cx) / (size * 0.5)
         ny = (py - cy) / (size * 0.5)
 
-        # Corps de la cloche (ellipse)
-        in_body = (nx ** 2 / 0.62 ** 2 + (ny + 0.06) ** 2 / 0.66 ** 2) < 1 and ny < 0.44
+        # Corps (grande ellipse jaune, légèrement à droite et en bas)
+        in_body = ((nx - 0.12) ** 2 / 0.72 ** 2 + (ny - 0.22) ** 2 / 0.52 ** 2) < 1
 
-        # Tige au sommet
-        in_handle = abs(nx) < 0.13 and -0.85 < ny < -0.52
+        # Tête (cercle jaune, en haut à gauche)
+        in_head = (nx + 0.20) ** 2 + (ny + 0.46) ** 2 < 0.36 ** 2
 
-        # Battant en bas
-        in_clapper = nx ** 2 + (ny - 0.60) ** 2 < 0.13 ** 2
+        # Queue (ovale vertical, côté droit, dépasse vers le haut)
+        in_tail = ((nx - 0.78) ** 2 / 0.20 ** 2 + (ny + 0.12) ** 2 / 0.50 ** 2) < 1
 
-        if in_body or in_handle or in_clapper:
-            return (26, 115, 232, 255)   # Google Blue
-        return (0, 0, 0, 0)             # Transparent
+        in_duck = in_body or in_head or in_tail
+
+        # Bec (triangle orange pointant à gauche, attaché à la tête)
+        beak_t = (nx + 0.82) / 0.26   # 0 à la pointe, 1 à la base
+        in_beak = -0.82 < nx < -0.56 and abs(ny + 0.46) < 0.13 * beak_t
+
+        # Œil (petit cercle sombre)
+        in_eye = (nx + 0.30) ** 2 + (ny + 0.54) ** 2 < 0.08 ** 2
+
+        # Aile (ovale légèrement plus sombre à l'intérieur du corps)
+        in_wing = ((nx - 0.15) ** 2 / 0.40 ** 2 + (ny - 0.22) ** 2 / 0.26 ** 2) < 1
+
+        if in_eye:
+            return (25, 20, 35, 255)       # œil sombre
+        if in_beak:
+            return (255, 120, 0, 255)      # bec orange
+        if in_duck and in_wing:
+            return (210, 162, 0, 255)      # aile dorée foncée
+        if in_duck:
+            return (255, 204, 0, 255)      # corps jaune canard
+        return (0, 0, 0, 0)               # transparent
 
     # Construction des données brutes
     raw = bytearray()

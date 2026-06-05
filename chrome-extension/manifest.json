@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Leboncoin Monitor",
+  "name": "Leboncoincoin",
   "version": "1.1.0",
   "description": "Reçois des notifications dès qu'une nouvelle annonce apparaît sur leboncoin.",
   "permissions": [

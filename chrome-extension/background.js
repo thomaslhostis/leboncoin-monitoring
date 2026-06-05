@@ -185,6 +185,14 @@ async function sendNotification(monitorId, title, message, targetUrl) {
     message: messageWithTime,
     requireInteraction: false,
   });
+
+  // Son canard si non muté
+  const { soundMuted = false } = await chrome.storage.local.get('soundMuted');
+  if (!soundMuted) {
+    ensureOffscreenDocument()
+      .then(() => chrome.runtime.sendMessage({ type: 'PLAY_QUACK' }))
+      .catch(() => {});
+  }
 }
 
 // ── Leboncoin fetching ────────────────────────────────────────────────────────
@@ -204,8 +212,8 @@ async function ensureOffscreenDocument() {
   if (contexts.length > 0) return;
   await chrome.offscreen.createDocument({
     url: OFFSCREEN_URL,
-    reasons: ['DOM_SCRAPING'],
-    justification: 'Parsing leboncoin search results HTML without a visible tab',
+    reasons: ['DOM_SCRAPING', 'AUDIO_PLAYBACK'],
+    justification: 'Fetching leboncoin pages without a visible tab, and playing duck notification sounds',
   });
 }
 

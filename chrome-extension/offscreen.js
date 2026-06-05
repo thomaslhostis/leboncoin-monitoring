@@ -6,14 +6,57 @@
  */
 
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
-  if (msg.type !== 'FETCH_LBC') return false;
+  if (msg.type === 'FETCH_LBC') {
+    fetchAndParse(msg.url)
+      .then((data) => reply({ ok: true, data }))
+      .catch((e) => reply({ ok: false, error: e.message }));
+    return true; // réponse asynchrone
+  }
 
-  fetchAndParse(msg.url)
-    .then((data) => reply({ ok: true, data }))
-    .catch((e) => reply({ ok: false, error: e.message }));
+  if (msg.type === 'PLAY_QUACK') {
+    playQuack();
+    reply({ ok: true });
+    return false;
+  }
 
-  return true; // réponse asynchrone
+  return false;
 });
+
+// ── Audio ─────────────────────────────────────────────────────────────────────
+
+let audioCtx = null;
+let quackBuffer = null;
+
+async function getQuackBuffer() {
+  if (quackBuffer) return quackBuffer;
+  if (!audioCtx) audioCtx = new AudioContext();
+  const response = await fetch('sounds/quack.wav');
+  const arrayBuffer = await response.arrayBuffer();
+  quackBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+  return quackBuffer;
+}
+
+async function playQuack() {
+  try {
+    if (!audioCtx) audioCtx = new AudioContext();
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+    const buffer = await getQuackBuffer();
+
+    const source = audioCtx.createBufferSource();
+    source.buffer = buffer;
+    source.playbackRate.value = 1.15; // légèrement plus aigu
+
+    const gain = audioCtx.createGain();
+    gain.gain.value = 0.6; // légèrement atténué
+
+    source.connect(gain);
+    gain.connect(audioCtx.destination);
+    source.start();
+  } catch (e) {
+    console.warn('[audio] playQuack failed', e);
+  }
+}
 
 async function fetchAndParse(url) {
   const res = await fetch(url, {

@@ -220,6 +220,15 @@ input:focus, select:focus {
 .btn-delete { background: #fce8e6; color: #c5221f; margin-left: auto; }
 .btn-delete:hover { background: #f5c6c2; }
 
+/* ── Settings row ─────────────────────────────────────────────────────────── */
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  color: #202124;
+}
+
 /* ── Toggle switch ────────────────────────────────────────────────────────── */
 .toggle { position: relative; display: inline-block; width: 38px; height: 21px; flex-shrink: 0; }
 .toggle input { opacity: 0; width: 0; height: 0; }

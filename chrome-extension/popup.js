@@ -193,9 +193,19 @@ async function initCurrentTabBtn() {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 
+async function initSoundToggle() {
+  const { soundMuted = false } = await chrome.storage.local.get('soundMuted');
+  const toggle = document.getElementById('soundToggle');
+  toggle.checked = !soundMuted;
+  toggle.addEventListener('change', (e) => {
+    chrome.storage.local.set({ soundMuted: !e.target.checked });
+  });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   loadMonitors();
   initCurrentTabBtn();
+  initSoundToggle();
   // Auto-refresh every 5 s so status stays current while popup is open
   setInterval(loadMonitors, 5000);
 });
