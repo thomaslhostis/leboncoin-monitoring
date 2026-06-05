@@ -135,9 +135,7 @@ async function checkPage(monitorId) {
       const newAds = ads.filter((ad) => !prevIds.includes(ad.id));
       if (newAds.length > 0) {
         const message =
-          newAds.length === 1
-            ? `${newAds[0].title}${newAds[0].price != null ? ` — ${newAds[0].price} €` : ''}`
-            : `${newAds.length} nouvelles annonces`;
+          newAds.length === 1 ? `1 nouvelle annonce` : `${newAds.length} nouvelles annonces`;
         // Toujours ouvrir la page de recherche au clic
         await sendNotification(monitor.id, `🔔 ${monitor.name}`, message, monitor.url);
       }
