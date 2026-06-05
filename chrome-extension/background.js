@@ -142,12 +142,21 @@ async function checkPage(monitorId) {
       }
     }
 
+    // Récupération après une série d'erreurs
+    if (monitor.errorNotified) {
+      await sendNotification(monitor.id, `✅ ${monitor.name}`, 'Leboncoin est de nouveau accessible', monitor.url);
+    }
+
     snapshots[monitorId] = { ids: ads.map((a) => a.id), updatedAt: now };
     await chrome.storage.local.set({ [KEY_SNAPSHOTS]: snapshots });
 
-    patch = { lastCheck: now, lastCount: ads.length, lastError: null };
+    patch = { lastCheck: now, lastCount: ads.length, lastError: null, errorNotified: false };
   } catch (err) {
-    patch = { lastCheck: now, lastError: err.message };
+    // N'envoyer qu'une seule notification par série d'erreurs consécutives
+    if (!monitor.errorNotified) {
+      await sendNotification(monitor.id, `⚠️ ${monitor.name}`, err.message, monitor.url);
+    }
+    patch = { lastCheck: now, lastError: err.message, errorNotified: true };
   }
 
   const { monitors: fresh = [] } = await chrome.storage.local.get(KEY_MONITORS);
