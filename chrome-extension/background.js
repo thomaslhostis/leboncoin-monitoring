@@ -249,7 +249,13 @@ async function ensureCheckerWindow() {
   // Créer la fenêtre dédiée une seule fois ; elle reste minimisée en permanence.
   // Naviguer dans son onglet ne déclenche pas de changement d'espace macOS,
   // contrairement à chrome.windows.create() qui en crée toujours un nouveau.
-  const win = await chrome.windows.create({ url: 'about:blank', state: 'minimized', focused: false });
+  // state:'minimized' est ignoré par Brave/macOS à la création — il faut
+  // appeler windows.update immédiatement après pour forcer la minimisation.
+  const win = await chrome.windows.create({ url: 'about:blank', focused: false });
+  // Attendre que la fenêtre soit prête avant de la minimiser (Brave/macOS
+  // ignore windows.update appelé trop tôt après la création).
+  await new Promise((r) => setTimeout(r, 500));
+  await chrome.windows.update(win.id, { state: 'minimized' });
   await chrome.storage.local.set({ [KEY_CHECKER_WIN]: win.id });
   return win.id;
 }
@@ -267,8 +273,10 @@ async function runInCheckerWindow(url) {
     func: extractLeboncoinDataFromPage,
   });
 
-  // Remettre à blanc pour libérer la mémoire jusqu'à la prochaine vérification
+  // Remettre à blanc pour libérer la mémoire, puis re-minimiser au cas où
+  // le chargement de l'URL aurait restauré la fenêtre sur macOS.
   chrome.tabs.update(tabId, { url: 'about:blank' }).catch(() => {});
+  chrome.windows.update(windowId, { state: 'minimized' }).catch(() => {});
 
   const data = result?.result;
   if (!data) throw new Error('Impossible de lire les données leboncoin (page inattendue ?)');
