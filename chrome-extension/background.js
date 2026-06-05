@@ -176,7 +176,7 @@ async function sendNotification(monitorId, title, message, targetUrl) {
   const hh = now.getHours().toString().padStart(2, '0');
   const mm = now.getMinutes().toString().padStart(2, '0');
   const time = `${hh}h${mm}`;
-  const messageWithTime = `${message}\n${time}`;
+  const messageWithTime = `${time} : ${message}`;
 
   chrome.notifications.create(notifId, {
     type: 'basic',
