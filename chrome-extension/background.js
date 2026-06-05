@@ -172,11 +172,17 @@ async function sendNotification(monitorId, title, message, targetUrl) {
   notifUrls[notifId] = targetUrl;
   await chrome.storage.local.set({ [KEY_NOTIF]: notifUrls });
 
+  const now = new Date();
+  const hh = now.getHours().toString().padStart(2, '0');
+  const mm = now.getMinutes().toString().padStart(2, '0');
+  const time = `${hh}h${mm}`;
+  const messageWithTime = `${message}\n${time}`;
+
   chrome.notifications.create(notifId, {
     type: 'basic',
     iconUrl: 'icons/icon48.png',
     title,
-    message,
+    message: messageWithTime,
     requireInteraction: false,
   });
 }
