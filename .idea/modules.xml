@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/leboncoin-monitoring.iml" filepath="$PROJECT_DIR$/leboncoin-monitoring.iml" />
+      <module fileurl="file://$PROJECT_DIR$/leboncoincoin-extension.iml" filepath="$PROJECT_DIR$/leboncoincoin-extension.iml" />
     </modules>
   </component>
 </project>

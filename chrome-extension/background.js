@@ -1,7 +1,7 @@
 const KEY_MONITORS = 'monitors';
 const KEY_SNAPSHOTS = 'snapshots';
 const KEY_NOTIF = 'notif_urls'; // maps notifId → URL to open on click
-const KEY_CHECKER_WIN = 'checker_window_id';
+const KEY_CAPTCHA_NOTIF = 'captcha_global_notified'; // notif captcha unique (globale)
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
@@ -20,6 +20,7 @@ async function recreateAlarms() {
       chrome.alarms.create(m.id, { periodInMinutes: m.frequency, delayInMinutes: 0.1 });
     }
   }
+  await refreshCaptchaState();
 }
 
 // ── Notifications ─────────────────────────────────────────────────────────────
@@ -57,6 +58,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   return true; // async response
 });
 
+// Signal du content-script : un onglet leboncoin réel est accessible (par ex.
+// après résolution manuelle du captcha) → on retire l'avertissement peu après.
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg?.type === 'LBC_ACCESSIBLE') onLeboncoinAccessible();
+});
+
 // ── CRUD helpers ──────────────────────────────────────────────────────────────
 
 async function addMonitor(monitor) {
@@ -80,6 +87,7 @@ async function removeMonitor(monitorId) {
     [KEY_SNAPSHOTS]: Object.fromEntries(Object.entries(snapshots).filter(([k]) => k !== monitorId)),
   });
   chrome.alarms.clear(monitorId);
+  await refreshCaptchaState();
 }
 
 async function toggleMonitor(monitorId, enabled) {
@@ -92,6 +100,7 @@ async function toggleMonitor(monitorId, enabled) {
   } else {
     chrome.alarms.clear(monitorId);
   }
+  await refreshCaptchaState();
 }
 
 async function updateFrequency(monitorId, frequency) {
@@ -137,35 +146,38 @@ async function checkPage(monitorId) {
       if (newAds.length > 0) {
         const message =
           newAds.length === 1 ? `1 nouvelle annonce` : `${newAds.length} nouvelles annonces`;
-        // Toujours ouvrir la page de recherche au clic
-        await sendNotification(monitor.id, `🔔 ${monitor.name}`, message, monitor.url);
+        // Toujours ouvrir la page de recherche au clic ; son uniquement ici.
+        await sendNotification(monitor.id, `🔔 ${monitor.name}`, message, monitor.url, { sound: true });
       }
-    }
-
-    // Récupération après une série d'erreurs
-    if (monitor.errorNotified) {
-      await sendNotification(monitor.id, `✅ ${monitor.name}`, 'Leboncoin est de nouveau accessible', monitor.url);
     }
 
     snapshots[monitorId] = { ids: ads.map((a) => a.id), updatedAt: now };
     await chrome.storage.local.set({ [KEY_SNAPSHOTS]: snapshots });
 
-    patch = { lastCheck: now, lastCount: ads.length, lastError: null, errorNotified: false };
+    patch = { lastCheck: now, lastCount: ads.length, lastError: null, captchaNotified: false };
   } catch (err) {
-    // N'envoyer qu'une seule notification par série d'erreurs consécutives
-    if (!monitor.errorNotified) {
-      await sendNotification(monitor.id, `⚠️ ${monitor.name}`, err.message, monitor.url);
+    if (err.captcha) {
+      // Captcha requis : on marque la surveillance bloquée. L'icône et l'UNIQUE
+      // notification (globale, pour toutes les alertes) sont gérées par
+      // refreshCaptchaState() appelé en fin de checkPage.
+      console.log(`[LBC] 🔐 captcha requis (${monitor.name})`);
+      patch = { lastCheck: now, lastError: err.message, captchaNotified: true };
+    } else {
+      // Erreurs transitoires (réseau, timeout, page inattendue…) : aucune notification.
+      console.warn(`[LBC] erreur silencieuse (${monitor.name}) : ${err.message}`);
+      patch = { lastCheck: now, lastError: err.message };
     }
-    patch = { lastCheck: now, lastError: err.message, errorNotified: true };
   }
 
   const { monitors: fresh = [] } = await chrome.storage.local.get(KEY_MONITORS);
   await chrome.storage.local.set({
     [KEY_MONITORS]: fresh.map((m) => (m.id === monitorId ? { ...m, ...patch } : m)),
   });
+
+  await refreshCaptchaState();
 }
 
-async function sendNotification(monitorId, title, message, targetUrl) {
+async function sendNotification(monitorId, title, message, targetUrl, { sound = false } = {}) {
   // ID unique par notification pour éviter qu'une notification existante bloque l'affichage
   const notifId = `notif-${monitorId}-${Date.now()}`;
   const { [KEY_NOTIF]: notifUrls = {} } = await chrome.storage.local.get(KEY_NOTIF);
@@ -186,21 +198,191 @@ async function sendNotification(monitorId, title, message, targetUrl) {
     requireInteraction: false,
   });
 
-  // Son canard si non muté
-  const { soundMuted = false } = await chrome.storage.local.get('soundMuted');
-  if (!soundMuted) {
-    ensureOffscreenDocument()
-      .then(() => chrome.runtime.sendMessage({ type: 'PLAY_QUACK' }))
-      .catch(() => {});
+  // Son canard : uniquement pour les nouvelles annonces (sound) et si non muté
+  if (sound) {
+    const { soundMuted = false } = await chrome.storage.local.get('soundMuted');
+    if (!soundMuted) {
+      ensureOffscreenDocument()
+        .then(() => chrome.runtime.sendMessage({ type: 'PLAY_QUACK' }))
+        .catch(() => {});
+    }
   }
 }
 
+// ── Icône de la barre d'outils ──────────────────────────────────────────────────
+// Quand au moins une surveillance active attend la résolution d'un captcha, on
+// superpose un triangle d'avertissement à l'icône de l'extension.
+
+const DEFAULT_ICON_PATHS = {
+  16: 'icons/icon16.png',
+  32: 'icons/icon32.png',
+  48: 'icons/icon48.png',
+  128: 'icons/icon128.png',
+};
+
+/**
+ * Recalcule l'état captcha global à partir des surveillances :
+ *  • icône d'avertissement si au moins une surveillance active est bloquée ;
+ *  • UNE SEULE notification pour l'ensemble des alertes (dédup via un flag global).
+ */
+async function refreshCaptchaState() {
+  const { monitors = [], [KEY_CAPTCHA_NOTIF]: alreadyNotified = false } =
+    await chrome.storage.local.get([KEY_MONITORS, KEY_CAPTCHA_NOTIF]);
+  const blocked = monitors.filter((m) => m.enabled !== false && m.captchaNotified);
+  const anyBlocked = blocked.length > 0;
+
+  await setActionWarning(anyBlocked);
+
+  if (anyBlocked && !alreadyNotified) {
+    await sendNotification(
+      'captcha',
+      '⚠️ Leboncoincoin',
+      'Veuillez ouvrir leboncoin.fr et résoudre le captcha',
+      blocked[0].url ?? 'https://www.leboncoin.fr',
+    );
+    await chrome.storage.local.set({ [KEY_CAPTCHA_NOTIF]: true });
+  } else if (!anyBlocked && alreadyNotified) {
+    await chrome.storage.local.set({ [KEY_CAPTCHA_NOTIF]: false });
+  }
+}
+
+// Efface l'avertissement quelques secondes après que leboncoin redevient
+// accessible (signal envoyé par le content-script depuis un onglet leboncoin réel).
+let clearCaptchaTimer = null;
+
+async function onLeboncoinAccessible() {
+  if (clearCaptchaTimer) return; // effacement déjà programmé
+  const { monitors = [] } = await chrome.storage.local.get(KEY_MONITORS);
+  if (!monitors.some((m) => m.enabled !== false && m.captchaNotified)) return; // rien à effacer
+  clearCaptchaTimer = setTimeout(() => {
+    clearCaptchaTimer = null;
+    clearAllCaptcha().catch(() => {});
+  }, 4000);
+}
+
+async function clearAllCaptcha() {
+  const { monitors = [] } = await chrome.storage.local.get(KEY_MONITORS);
+  if (monitors.some((m) => m.captchaNotified)) {
+    await chrome.storage.local.set({
+      [KEY_MONITORS]: monitors.map((m) => (m.captchaNotified ? { ...m, captchaNotified: false } : m)),
+    });
+  }
+  await refreshCaptchaState(); // retire l'icône + remet le flag global à false
+}
+
+async function setActionWarning(on) {
+  if (!on) {
+    chrome.action.setIcon({ path: DEFAULT_ICON_PATHS }).catch(() => {});
+    chrome.action.setBadgeText({ text: '' }).catch(() => {});
+    return;
+  }
+  try {
+    // Dessine l'icône de base + un triangle d'avertissement dans chaque taille.
+    const imageData = {};
+    for (const size of [16, 32, 48, 128]) {
+      const resp = await fetch(chrome.runtime.getURL(`icons/icon${size}.png`));
+      const bitmap = await createImageBitmap(await resp.blob());
+      const canvas = new OffscreenCanvas(size, size);
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(bitmap, 0, 0, size, size);
+      drawWarningTriangle(ctx, size);
+      imageData[size] = ctx.getImageData(0, 0, size, size);
+    }
+    await chrome.action.setIcon({ imageData });
+  } catch (e) {
+    // Repli si OffscreenCanvas indisponible : un badge « ! » orange.
+    console.warn('[LBC] icône warning via canvas échouée, repli badge :', e.message);
+    chrome.action.setBadgeText({ text: '!' }).catch(() => {});
+    chrome.action.setBadgeBackgroundColor({ color: '#E11900' }).catch(() => {});
+  }
+}
+
+/**
+ * Pastille d'avertissement moderne dans le coin bas-droit de l'icône :
+ * triangle aux coins arrondis, halo blanc pour le détacher du fond, « ! » blanc.
+ */
+function drawWarningTriangle(ctx, S) {
+  const m = S * 0.05;
+  const w = S * 0.62;
+  const h = w * 0.88;
+  const right = S - m;
+  const bottom = S - m;
+  const left = right - w;
+  const top = bottom - h;
+  const apexX = (left + right) / 2;
+
+  const pts = [
+    { x: apexX, y: top },     // sommet haut
+    { x: right, y: bottom },  // bas-droit
+    { x: left, y: bottom },   // bas-gauche
+  ];
+  const r = S * 0.14; // rayon des coins arrondis
+
+  roundedPolygonPath(ctx, pts, r);
+
+  // Halo blanc (contour épais centré sur le tracé → moitié visible à l'extérieur).
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = '#FFFFFF';
+  ctx.lineWidth = Math.max(1.5, S * 0.14);
+  ctx.stroke();
+
+  // Remplissage ambre/orange moderne.
+  const grad = ctx.createLinearGradient(0, top, 0, bottom);
+  grad.addColorStop(0, '#FFB020');
+  grad.addColorStop(1, '#FF8A00');
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Point d'exclamation blanc (capsule + point), à partir de 32 px.
+  if (S >= 32) {
+    ctx.fillStyle = '#FFFFFF';
+    const barW = S * 0.075;
+    const barTop = top + h * 0.32;
+    const barBot = bottom - h * 0.34;
+    fillVerticalCapsule(ctx, apexX, barTop, barBot, barW);
+    ctx.beginPath();
+    ctx.arc(apexX, bottom - h * 0.16, barW * 0.62, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+/** Trace un polygone à coins arrondis (via les milieux d'arêtes + arcTo). */
+function roundedPolygonPath(ctx, pts, r) {
+  const n = pts.length;
+  ctx.beginPath();
+  for (let i = 0; i <= n; i++) {
+    const p0 = pts[i % n];
+    const p1 = pts[(i + 1) % n];
+    const mid = { x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2 };
+    if (i === 0) ctx.moveTo(mid.x, mid.y);
+    else ctx.arcTo(p0.x, p0.y, mid.x, mid.y, r);
+  }
+  ctx.closePath();
+}
+
+/** Remplit une capsule verticale (rectangle à bouts arrondis) centrée en cx. */
+function fillVerticalCapsule(ctx, cx, top, bottom, width) {
+  const r = width / 2;
+  ctx.beginPath();
+  ctx.arc(cx, top + r, r, Math.PI, 0);
+  ctx.arc(cx, bottom - r, r, 0, Math.PI);
+  ctx.closePath();
+  ctx.fill();
+}
+
 // ── Leboncoin fetching ────────────────────────────────────────────────────────
-// Stratégie en deux temps :
-//  1. Offscreen document : page HTML invisible (pas d'onglet dans la barre),
+// Stratégie en trois temps, de la moins à la plus intrusive :
+//  1. fetch() offscreen : page HTML invisible (pas d'onglet, pas de fenêtre),
 //     fetch() avec credentials:'include' → envoie __cf_clearance automatiquement.
-//     Fonctionne tant que le cookie Cloudflare est valide (visite récente du site).
-//  2. Onglet en arrière-plan : filet de sécurité toujours fonctionnel.
+//     Fonctionne tant que le cookie Cloudflare est valide.
+//  2. iframe offscreen : si le cookie a expiré, on charge leboncoin dans une
+//     <iframe> invisible (toujours pas de fenêtre). Le JS de challenge Cloudflare
+//     s'y exécute et renouvelle le cookie, puis on relit via fetch(). Expérimental :
+//     Cloudflare peut refuser d'émettre la clearance dans un contexte framé.
+//  3. rendu réel : filet de sécurité. Onglet d'arrière-plan dans une fenêtre
+//     déjà ouverte (sinon une nouvelle fenêtre, non minimisée et sans focus) ;
+//     la navigation renouvelle le cookie / lit la page / détecte le captcha,
+//     puis l'onglet est refermé aussitôt.
 
 const OFFSCREEN_URL = chrome.runtime.getURL('offscreen.html');
 
@@ -218,8 +400,59 @@ async function ensureOffscreenDocument() {
 }
 
 async function fetchLeboncoinAds(url) {
-  // ── Tentatives via offscreen document (aucun onglet visible) ─────────────
-  const DELAYS = [0, 800, 2000]; // 3 essais : immédiat, 800 ms, 2 s
+  // On retient si un niveau a vu une page de challenge Cloudflare : si tous
+  // échouent, c'est qu'un captcha interactif est requis (à résoudre à la main).
+  let sawChallenge = false;
+
+  // ── 1. Voie rapide : fetch offscreen (cookie Cloudflare encore valide) ────
+  try {
+    const data = await fetchViaOffscreen(url);
+    console.log('[LBC] ✓ fetch offscreen (sans fenêtre)');
+    return data;
+  } catch (e) {
+    if (looksLikeChallenge(e.message)) sawChallenge = true;
+    console.warn(`[LBC] fetch offscreen échoué (${e.message}) → renouvellement cookie via iframe`);
+  }
+
+  // ── 2. Expérimental : renouveler le cookie via iframe offscreen (sans fenêtre) ──
+  try {
+    const data = await renewViaIframeAndFetch(url);
+    console.log('[LBC] ✓ renouvellement iframe offscreen (sans fenêtre)');
+    return data;
+  } catch (e) {
+    if (looksLikeChallenge(e.message)) sawChallenge = true;
+    console.warn(`[LBC] renouvellement iframe échoué (${e.message}) → fallback fenêtre éphémère`);
+  }
+
+  // ── 3. Filet de sécurité : fenêtre éphémère (créée puis fermée) ───────────
+  try {
+    const data = await fetchLeboncoinAdsViaTab(url);
+    console.log('[LBC] ✓ fenêtre éphémère');
+    return data;
+  } catch (e) {
+    if (e.captcha) throw e; // challenge confirmé par la fenêtre → déjà tagué
+    if (looksLikeChallenge(e.message)) sawChallenge = true;
+    // Si un niveau a vu un challenge mais qu'aucun n'a pu le franchir → captcha humain.
+    if (sawChallenge) throw Object.assign(new Error('Captcha leboncoin requis'), { captcha: true });
+    throw e; // erreur purement transitoire (réseau, timeout) → non notifiée
+  }
+}
+
+/** Heuristique : ce message d'erreur évoque-t-il une page de challenge Cloudflare ? */
+function looksLikeChallenge(message = '') {
+  const m = message.toLowerCase();
+  return (
+    m.includes('challenge') ||
+    m.includes('captcha') ||
+    m.includes('cloudflare') ||
+    m.includes('http 403') ||
+    m.includes('http 503') ||
+    m.includes('__next_data__') // 200 sans __NEXT_DATA__ = page de challenge
+  );
+}
+
+async function fetchViaOffscreen(url) {
+  const DELAYS = [0, 800]; // 2 essais : immédiat, 800 ms (couvre les aléas réseau)
   let lastError;
   for (const delay of DELAYS) {
     if (delay > 0) await new Promise((r) => setTimeout(r, delay));
@@ -230,71 +463,124 @@ async function fetchLeboncoinAds(url) {
       throw new Error(result?.error ?? 'Réponse invalide du document offscreen');
     } catch (e) {
       lastError = e;
-      console.warn(`[LBC] offscreen tentative échouée (${e.message}), réinitialisation…`);
-      // Recrée le document pour repartir d'un état propre
-      try { await chrome.offscreen.closeDocument(); } catch (_) {}
     }
   }
-
-  console.warn('[LBC] offscreen définitivement échoué, fallback onglet :', lastError?.message);
-
-  // ── Fallback : onglet en arrière-plan (fenêtre minimisée) ─────────────────
-  return fetchLeboncoinAdsViaTab(url);
+  throw lastError ?? new Error('fetch offscreen échoué');
 }
 
+async function renewViaIframeAndFetch(url) {
+  await enableIframeHeaderStripping();
+  try {
+    await ensureOffscreenDocument();
+    const result = await chrome.runtime.sendMessage({ type: 'RENEW_VIA_IFRAME', url });
+    if (result?.ok && result.data) return result.data;
+    throw new Error(result?.error ?? 'Réponse invalide du document offscreen');
+  } finally {
+    await disableIframeHeaderStripping();
+  }
+}
 
-// File d'attente : les vérifications utilisent toutes la même fenêtre dédiée,
-// elles doivent donc s'exécuter l'une après l'autre.
+// ── declarativeNetRequest : retire les protections anti-iframe de leboncoin ──
+// Uniquement pour les sous-cadres (resourceTypes:['sub_frame']) et seulement le
+// temps du renouvellement, donc la navigation normale sur leboncoin est intacte.
+const IFRAME_RULE_ID = 1001;
+
+async function enableIframeHeaderStripping() {
+  await chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: [IFRAME_RULE_ID],
+    addRules: [{
+      id: IFRAME_RULE_ID,
+      priority: 1,
+      action: {
+        type: 'modifyHeaders',
+        responseHeaders: [
+          { header: 'x-frame-options', operation: 'remove' },
+          { header: 'content-security-policy', operation: 'remove' },
+          { header: 'content-security-policy-report-only', operation: 'remove' },
+        ],
+      },
+      condition: {
+        urlFilter: '||leboncoin.fr',
+        resourceTypes: ['sub_frame'],
+      },
+    }],
+  });
+}
+
+async function disableIframeHeaderStripping() {
+  try {
+    await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [IFRAME_RULE_ID] });
+  } catch (_) { /* rien à nettoyer */ }
+}
+
+// File d'attente : les vérifications par rendu s'exécutent l'une après l'autre
+// pour ne jamais ouvrir plusieurs onglets/fenêtres simultanément.
 let checkerQueue = Promise.resolve();
 
 async function fetchLeboncoinAdsViaTab(url) {
-  const result = await (checkerQueue = checkerQueue.then(() => runInCheckerWindow(url)));
+  const result = await (checkerQueue = checkerQueue.then(() => runInCheckerContext(url)));
   return result;
 }
 
-async function ensureCheckerWindow() {
-  const { [KEY_CHECKER_WIN]: storedId } = await chrome.storage.local.get(KEY_CHECKER_WIN);
-  if (storedId != null) {
-    try {
-      await chrome.windows.get(storedId);
-      return storedId; // fenêtre toujours vivante
-    } catch (_) { /* fermée par l'utilisateur, on en recrée une */ }
-  }
-  // Créer la fenêtre dédiée une seule fois ; elle reste minimisée en permanence.
-  // Naviguer dans son onglet ne déclenche pas de changement d'espace macOS,
-  // contrairement à chrome.windows.create() qui en crée toujours un nouveau.
-  // state:'minimized' est ignoré par Brave/macOS à la création — il faut
-  // appeler windows.update immédiatement après pour forcer la minimisation.
-  const win = await chrome.windows.create({ url: 'about:blank', focused: false });
-  // Attendre que la fenêtre soit prête avant de la minimiser (Brave/macOS
-  // ignore windows.update appelé trop tôt après la création).
-  await new Promise((r) => setTimeout(r, 500));
-  await chrome.windows.update(win.id, { state: 'minimized' });
-  await chrome.storage.local.set({ [KEY_CHECKER_WIN]: win.id });
-  return win.id;
+/** Choisit une fenêtre « normale » existante (focalisée et non minimisée en priorité). */
+async function pickHostWindow() {
+  const wins = await chrome.windows.getAll({ windowTypes: ['normal'] });
+  if (wins.length === 0) return null;
+  return (
+    wins.find((w) => w.focused && w.state !== 'minimized') ??
+    wins.find((w) => w.state !== 'minimized') ??
+    wins[0]
+  );
 }
 
-async function runInCheckerWindow(url) {
-  const windowId = await ensureCheckerWindow();
-  const win = await chrome.windows.get(windowId, { populate: true });
-  const tabId = win.tabs[0].id;
+async function runInCheckerContext(url) {
+  // Rendu de la page (renouvelle le cookie + permet de lire/détecter le captcha) :
+  //  • si une fenêtre est déjà ouverte → onglet d'arrière-plan (aucune fenêtre en plus) ;
+  //  • sinon → une fenêtre, NON minimisée et sans voler le focus.
+  // L'onglet de vérification est fermé à la fin (ce qui ferme la fenêtre si on l'a
+  // créée juste pour lui).
+  const host = await pickHostWindow();
 
-  await chrome.tabs.update(tabId, { url });
-  await waitForTabComplete(tabId, 30_000);
+  let tabId;
+  if (host) {
+    const tab = await chrome.tabs.create({ windowId: host.id, url, active: false });
+    tabId = tab.id;
+  } else {
+    const win = await chrome.windows.create({ url, focused: false });
+    tabId = win.tabs[0].id;
+  }
 
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: extractLeboncoinDataFromPage,
-  });
+  try {
+    // On sonde même en cas de timeout : une page de captcha peut rester "loading".
+    let timedOut = false;
+    try {
+      await waitForTabComplete(tabId, 30_000);
+    } catch (_) {
+      timedOut = true;
+    }
 
-  // Remettre à blanc pour libérer la mémoire, puis re-minimiser au cas où
-  // le chargement de l'URL aurait restauré la fenêtre sur macOS.
-  chrome.tabs.update(tabId, { url: 'about:blank' }).catch(() => {});
-  chrome.windows.update(windowId, { state: 'minimized' }).catch(() => {});
+    let injected = false;
+    let data = null;
+    try {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: extractLeboncoinDataFromPage,
+      });
+      injected = true;
+      data = result?.result ?? null;
+    } catch (_) { /* page non injectable (erreur réseau, about:blank) → injected=false */ }
 
-  const data = result?.result;
-  if (!data) throw new Error('Impossible de lire les données leboncoin (page inattendue ?)');
-  return data;
+    if (injected && Array.isArray(data)) return data;
+    // Injecté sur une page leboncoin sans __NEXT_DATA__ = challenge/captcha confirmé.
+    if (injected && data && data.__challenge) {
+      throw Object.assign(new Error('Captcha leboncoin requis'), { captcha: true });
+    }
+    // Impossible d'injecter (page non chargée) → transitoire, pas un captcha.
+    if (timedOut) throw new Error('Timeout de chargement de la page (30 s)');
+    throw new Error('Impossible de lire les données leboncoin (page inattendue ?)');
+  } finally {
+    chrome.tabs.remove(tabId).catch(() => {});
+  }
 }
 
 /** Attend que l'onglet atteigne le statut "complete" ou lève une erreur en cas de timeout. */
@@ -317,22 +603,23 @@ async function waitForTabComplete(tabId, timeoutMs) {
  */
 function extractLeboncoinDataFromPage() {
   const el = document.getElementById('__NEXT_DATA__');
-  if (!el) return null;
-
-  let data;
-  try {
-    data = JSON.parse(el.textContent);
-  } catch (_) {
-    return null;
+  if (el) {
+    try {
+      const data = JSON.parse(el.textContent);
+      const ads = data?.props?.pageProps?.searchData?.ads;
+      if (Array.isArray(ads)) {
+        return ads.map((ad) => ({
+          id: String(ad.list_id),
+          url: `https://www.leboncoin.fr${ad.url}`,
+          title: ad.subject ?? 'Sans titre',
+          price: ad.price?.[0] ?? null,
+        }));
+      }
+    } catch (_) { /* données illisibles → traité comme un challenge ci-dessous */ }
   }
 
-  const ads = data?.props?.pageProps?.searchData?.ads;
-  if (!Array.isArray(ads)) return null;
-
-  return ads.map((ad) => ({
-    id: String(ad.list_id),
-    url: `https://www.leboncoin.fr${ad.url}`,
-    title: ad.subject ?? 'Sans titre',
-    price: ad.price?.[0] ?? null,
-  }));
+  // Page leboncoin chargée mais SANS __NEXT_DATA__ exploitable : la vraie page de
+  // recherche en contient toujours (même sans résultat), donc c'est forcément une
+  // page de challenge/captcha Cloudflare. On le signale pour notifier l'utilisateur.
+  return { __challenge: true };
 }
